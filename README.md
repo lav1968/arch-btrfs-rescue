@@ -1,11 +1,9 @@
-
 # Arch Linux Btrfs Rescue System (UKI)
 
-[English](#english) | [Hrvatski](#hrvatski)
+[Read instructions in Croatian here / Pročitajte upute na hrvatskom jeziku ovdje](README.hr.md)
 
 ---
 
-<a name="english"></a>
 ## English
 
 Automated **Rescue UKI** (Unified Kernel Image) snapshot system for Arch Linux.
@@ -16,14 +14,14 @@ Automated **Rescue UKI** (Unified Kernel Image) snapshot system for Arch Linux.
 - Automatically fixes `fstab` within snapshots to ensure `@home` is mounted correctly.
 - Includes manual rollback and cleanup scripts.
 
-### Scripts
+### Scripts in this repository
 - `setup-rescue.sh`: Main installer (Snapper + Hooks + GRUB config).
 - `create-rescue-snapshot`: Core logic for generating UKI and patching fstab.
 - `rollback.sh`: Manual restore script (moves snapshot back to `@`).
-- `cleanup-broken.sh`: Deletes old `@_broken_` subvolumes after rollback.
+- `cleanup-broken.sh`: Deletes old `@_broken_` subvolumes after recovery.
 
 ### Installation
 ```bash
-git clone https://github.com/lav1968/arch-btrfs-rescue.git
+git clone https://github.com
 cd arch-btrfs-rescue
 sudo ./setup-rescue.sh
