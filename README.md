@@ -22,6 +22,6 @@ Automated **Rescue UKI** (Unified Kernel Image) snapshot system for Arch Linux.
 
 ### Installation
 ```bash
-git clone https://github.com
+git clone https://github.com/lav1968/arch-btrfs-rescue.git
 cd arch-btrfs-rescue
 sudo ./setup-rescue.sh
