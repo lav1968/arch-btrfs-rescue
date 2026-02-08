@@ -1,0 +1,16 @@
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Operation = Remove
+Type = Path
+Target = usr/lib/modules/*/vmlinuz
+
+
+[Action]
+Depends = rsync
+Depends = snapper
+Depends = mkinitcpio
+Description = Generiranje Rescue UKI zapisa unutar snapshota...
+When = PostTransaction
+Exec = /usr/bin/bash -c 'SNAP_ID=$(snapper create -d "Rescue-$(date +%Y%m%d)" --print-number); btrfs property set -ts "/.snapshots/$SNAP_ID/snapshot" ro false; S_ID=$(btrfs subvolume list / | grep ".snapshots/$SNAP_ID/snapshot" | awk "{print \$2}"); mkdir -p "/.snapshots/$SNAP_ID/snapshot/boot"; echo "root=UUID=87fec617-ee55-46c4-8a0b-bf8d90c04587 rw rootflags=subvolid=$S_ID rootfstype=btrfs kernel.watchdog=0 modprobe.blacklist=sp5100_tco" > /tmp/rescue_cmd; mkinitcpio -k /boot/vmlinuz-linux -c /etc/mkinitcpio.conf --uki "/.snapshots/$SNAP_ID/snapshot/boot/rescue.efi" --cmdline /tmp/rescue_cmd; chmod 644 "/.snapshots/$SNAP_ID/snapshot/boot/rescue.efi"; cp /efi/EFI/Linux/arch-linux.efi /efi/EFI/BOOT/BOOTX64.EFI; DATE=$(date +%Y_%m_%d_%H.%M.%S); DEST="/.bootbackup/${DATE}_post"; mkdir -p "$DEST"; rsync -a --delete /efi/ "$DEST/"; echo "$SNAP_ID" > "$DEST/snap_id.txt"; grub-mkconfig -o /boot/grub/grub.cfg'
+

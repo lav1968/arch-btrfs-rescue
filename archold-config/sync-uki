@@ -1,0 +1,23 @@
+#!/bin/bash
+# Sinkronizacija UKI zapisa - Siječanj 2026.
+
+# 1. Osiguraj da je /efi montiran (nvme0n1p2)
+if ! mountpoint -q /efi; then
+    mount /dev/nvme0n1p2 /efi
+fi
+
+# 2. Provjera subvolumea
+CURRENT_SUBVOL=$(cat /proc/self/mountinfo | grep " / " | awk '{print $4}')
+
+if [[ "$CURRENT_SUBVOL" == *"snapshot"* ]]; then
+    echo "Sync-uki: Detektiran snapshot. Kopiram rescue.efi..."
+    cp "/boot/rescue.efi" "/efi/EFI/Linux/arch-linux.efi"
+    cp "/boot/rescue.efi" "/efi/EFI/BOOT/BOOTX64.EFI"
+else
+    echo "Sync-uki: Detektiran glavni sustav (@). Radim mkinitcpio..."
+    mkinitcpio -P
+    cp "/efi/EFI/Linux/arch-linux.efi" "/efi/EFI/BOOT/BOOTX64.EFI"
+fi
+
+sync # Prisili zapis na disk
+echo "Sync-uki: Sinkronizacija završena."

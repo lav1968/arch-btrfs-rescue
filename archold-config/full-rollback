@@ -1,0 +1,55 @@
+#!/bin/bash
+# Manualni Rollback - nvme0n1p1 (Btrfs)
+
+DEVICE="/dev/nvme0n1p1"
+MOUNT_POINT="/data"
+
+echo "--- START: MANUALNI ROLLBACK ---"
+
+# 1. Root provjera
+if [ "$(id -u)" -ne 0 ]; then
+    echo "GRESKA: Pokrenite kao root (sudo full-rollback)."
+    exit 1
+fi
+
+# 2. Detekcija trenutnog snapshota
+CURRENT_PATH=$(cat /proc/self/mountinfo | grep " / " | awk '{print $4}')
+SNAP_ID=$(echo "$CURRENT_PATH" | grep -oP '(?<=snapshots/)\d+')
+
+if [ -z "$SNAP_ID" ]; then
+    echo "GRESKA: Ne mogu detektirati ID snapshota iz: $CURRENT_PATH"
+    exit 1
+fi
+echo "Detektiran ID snapshota: $SNAP_ID"
+
+# 3. Montiranje korijena particije (nvme0n1p1)
+mkdir -p $MOUNT_POINT
+mount $DEVICE $MOUNT_POINT -o subvol=/ || { echo "GRESKA: Mount propao!"; exit 1; }
+
+# 4. Traženje izvora
+if [ -d "$MOUNT_POINT/@snapshots/$SNAP_ID/snapshot" ]; then
+    SRC="/@snapshots/$SNAP_ID/snapshot"
+else
+    SRC="/.snapshots/$SNAP_ID/snapshot"
+fi
+echo "Izvor snapshota: $SRC"
+
+# 5. Zamjena subvolume-a
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+if [ -d "$MOUNT_POINT/@" ]; then
+    echo "Premještam stari @ u @_broken_$TIMESTAMP"
+    mv "$MOUNT_POINT/@" "$MOUNT_POINT/@_broken_$TIMESTAMP"
+fi
+
+echo "Kreiram novi @ iz snapshota..."
+btrfs subvolume snapshot "$MOUNT_POINT$SRC" "$MOUNT_POINT/@"
+
+# 6. Pozivanje sinkronizacije (bez sudo)
+echo "--- 4. SINKRONIZACIJA EFI ---"
+/usr/local/bin/sync-uki
+
+# 7. Čišćenje
+umount $MOUNT_POINT
+echo "----------------------------------------------------"
+echo "ROLLBACK USPJEŠAN! Možete upisati: reboot"
+echo "----------------------------------------------------"

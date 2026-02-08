@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Path
+Target = usr/lib/modules/*/vmlinuz
+
+[Action]
+Description = Sinkronizacija UKI zapisa u BOOTX64.EFI (Fallback)...
+When = PostTransaction
+Exec = /usr/bin/bash -c 'if [ -f /efi/EFI/Linux/arch-linux.efi ]; then cp /efi/EFI/Linux/arch-linux.efi /efi/EFI/BOOT/BOOTX64.EFI && echo "Fallback UKI (BOOTX64.EFI) je sinkroniziran."; else echo "Greska: arch-linux.efi nije pronadjen!"; fi'
