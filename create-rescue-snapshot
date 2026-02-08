@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# --- 1. ZAŠTITA: Provjera boota iz snapshota ---
+CURRENT_OPTS=$(findmnt -n -o OPTIONS /)
+if [[ "$CURRENT_OPTS" == *"@snapshots"* ]]; then
+    echo "STOP: Sustav je pokrenut iz snapshota. Backup se preskače."
+    exit 0
+fi
+
+# --- 2. DETEKCIJA PARAMETARA ---
+# Dohvaćamo UUID-ove (findmnt osigurava portabilnost između VDA i NVMe)
+R_UUID=$(findmnt -n -o UUID /)
+B_UUID=$(findmnt -n -o UUID /boot)
+
+if [ -z "$R_UUID" ]; then
+    echo "GRESKA: Ne mogu detektirati ROOT UUID!"
+    exit 1
+fi
+sync
+
+# --- 3. KREIRANJE SNAPSHOTA ---
+echo "--- Faza 1: Snapper Snapshot ---"
+S_ID=$(snapper -c root create -d "Rescue-$(date +%Y%m%d)" --print-number)
+
+if [ -z "$S_ID" ] || [ "$S_ID" -eq 0 ]; then
+    echo "GRESKA: Snapper nije uspio kreirati snapshot!"
+    exit 1
+fi
+
+S_PATH="/.snapshots/$S_ID/snapshot"
+
+# Postavljanje snapshota u Read-Write mod
+btrfs property set -ts "$S_PATH" ro false
+
+# --- 4. GENERIRANJE RESCUE UKI-ja ---
+echo "--- Faza 2: Generiranje Rescue UKI-ja ---"
+mkdir -p "$S_PATH/boot"
+
+# Kernel parametri (Uključujemo tvoj compress i discard za performanse)
+echo "root=UUID=$R_UUID rw rootflags=subvol=/@snapshots/$S_ID/snapshot compress=zstd:3,discard=async kernel.watchdog=0" > /tmp/rescue_cmd
+
+# Izrada UKI-ja (Unified Kernel Image)
+mkinitcpio -k /boot/vmlinuz-linux -c /etc/mkinitcpio.conf --uki "$S_PATH/boot/rescue.efi" --cmdline /tmp/rescue_cmd
+chmod 644 "$S_PATH/boot/rescue.efi"
+
+# --- 5. FSTAB RESET (Rješenje za @home problem) ---
+echo "--- Faza 3: Generiranje FSTAB-a u snapshotu ---"
+if [ -f "$S_PATH/etc/fstab" ]; then
+    # Kreiranje mount pointa unutar snapshota
+    mkdir -p "$S_PATH/home" "$S_PATH/var/log" "$S_PATH/var/cache/pacman/pkg" "$S_PATH/.snapshots"
+
+    TMP_FSTAB="/tmp/fstab_gen"
+    
+    # 1. Zadržavamo boot particiju (vfat)
+    grep "UUID=$B_UUID" "$S_PATH/etc/fstab" > "$TMP_FSTAB"
+    
+    # 2. Generiramo čiste Btrfs linije (usklađeno s tvojim /@ layoutom)
+    echo "UUID=$R_UUID / btrfs rw,relatime,compress=zstd:3,discard=async,space_cache=v2,subvol=/@snapshots/$S_ID/snapshot 0 0" >> "$TMP_FSTAB"
+    echo "UUID=$R_UUID /home btrfs rw,relatime,compress=zstd:3,discard=async,space_cache=v2,subvol=/@home 0 0" >> "$TMP_FSTAB"
+    echo "UUID=$R_UUID /var/cache/pacman/pkg btrfs rw,relatime,compress=zstd:3,discard=async,space_cache=v2,subvol=/@pkg 0 0" >> "$TMP_FSTAB"
+    echo "UUID=$R_UUID /var/log btrfs rw,relatime,compress=zstd:3,discard=async,space_cache=v2,subvol=/@log 0 0" >> "$TMP_FSTAB"
+    echo "UUID=$R_UUID /.snapshots btrfs rw,relatime,compress=zstd:3,subvol=/@snapshots 0 0" >> "$TMP_FSTAB"
+    
+    mv "$TMP_FSTAB" "$S_PATH/etc/fstab"
+fi
+
+# --- 6. BACKUP /BOOT I ROTACIJA ---
+echo "--- Faza 4: Backup boot particije ---"
+DATE=$(date +%Y_%m_%d_%H.%M.%S)
+DEST="/.bootbackup/${DATE}_post"
+mkdir -p "$DEST"
+
+rsync -a --delete /boot/ "$DEST/"
+echo "$S_ID" > "$DEST/snap_id.txt"
+
+# Čišćenje: ostavljamo zadnjih 5 backupa
+ls -1dt /.bootbackup/*_post/ | tail -n +6 | xargs rm -rf 2>/dev/null
+
+# --- 7. FINALIZACIJA ---
+sync
+grub-mkconfig -o /boot/grub/grub.cfg
+echo "--- GOTOVO: Rescue Snapshot ID $S_ID je spreman ---"
