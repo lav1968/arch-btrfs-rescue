@@ -9,6 +9,7 @@ fi
 
 # --- 2. DETEKCIJA ---
 R_UUID=$(findmnt -n -o UUID /)
+[ -z "$R_UUID" ] && exit 1
 sync
 
 # --- 3. SNAPSHOT ---
@@ -27,28 +28,28 @@ echo "root=UUID=$R_UUID rw rootflags=subvol=/@snapshots/$S_ID/snapshot $R_OPTS" 
 mkinitcpio -k /boot/vmlinuz-linux -c /etc/mkinitcpio.conf --uki "$S_PATH/boot/rescue.efi" --cmdline /tmp/rescue_cmd
 chmod 644 "$S_PATH/boot/rescue.efi"
 
-# --- 5. UNIVERZALNO KRPANJE FSTAB-A (Bez duplanja) ---
+# --- 5. UNIVERZALNO KRPANJE FSTAB-A (EFI/ESP Podrška) ---
 if [ -f "$S_PATH/etc/fstab" ]; then
-    # Osiguraj mount pointe
-    mkdir -p "$S_PATH/home" "$S_PATH/var/log" "$S_PATH/var/cache/pacman/pkg" "$S_PATH/var/tmp" "$S_PATH/.snapshots"
+    # Osiguraj sve potrebne mount pointe unutar snapshota
+    mkdir -p "$S_PATH/home" "$S_PATH/var/log" "$S_PATH/var/cache/pacman/pkg" "$S_PATH/var/tmp" "$S_PATH/.snapshots" "$S_PATH/efi"
 
     TMP_FSTAB=$(mktemp)
     
     while IFS= read -r line || [ -n "$line" ]; do
-        # Kopiraj komentare i prazne linije
+        # Zadrži komentare i prazne linije
         if [[ "$line" =~ ^# ]] || [[ -z "$line" ]]; then
             echo "$line" >> "$TMP_FSTAB"
             continue
         fi
 
-        # Provjera mount pointa (2. stupac u fstabu)
+        # Dohvati mount point (2. stupac)
         MP=$(echo "$line" | awk '{print $2}')
 
         if [ "$MP" == "/" ]; then
-            # Mijenjamo samo subvol za root, ostalo (UUID, opcije) ostaje isto
+            # Mijenjamo samo root subvolumen na putanju snapshota
             echo "$line" | sed "s|\(subvol=\)[^, ]*|\1/@snapshots/$S_ID/snapshot|g" >> "$TMP_FSTAB"
         else
-            # Sve ostale linije (/home, /mnt, /var...) ostaju identične
+            # Sve ostale linije (/home, /efi, /mnt...) prepisujemo IDENTIČNO
             echo "$line" >> "$TMP_FSTAB"
         fi
     done < "$S_PATH/etc/fstab"
