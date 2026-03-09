@@ -1,71 +1,45 @@
 #!/bin/bash
-
-# --- 1. ZAŠTITA ---
-CURRENT_OPTS=$(findmnt -n -o OPTIONS /)
+# 1. Zastita
+CURRENT_OPTS=$(findmnt -n -o SOURCE /)
 if [[ "$CURRENT_OPTS" == *"@snapshots"* ]]; then
-    echo "Sustav je pokrenut iz snapshota. Preskačem."
+    echo "Sustav je bootan iz snapshota. Preskacem."
     exit 0
 fi
 
-# --- 2. DETEKCIJA ---
-R_UUID=$(findmnt -n -o UUID /)
-[ -z "$R_UUID" ] && exit 1
+# 2. Parametri (dohvaćeni prilikom setup-a)
+R_UUID="87fec617-ee55-46c4-8a0b-bf8d90c04587"
+B_UUID=""
+R_OPTS="rw,noatime,compress=zstd:5,ssd,discard=async,space_cache=v2"
+
 sync
 
-# --- 3. SNAPSHOT ---
+# 3. Snapshot
 S_ID=$(snapper -c root create -d "Rescue-$(date +%Y%m%d)" --print-number)
 [ -z "$S_ID" ] && exit 1
-
 S_PATH="/.snapshots/$S_ID/snapshot"
 btrfs property set -ts "$S_PATH" ro false
 
-# --- 4. UKI GENERIRANJE ---
+# 4. UKI Generiranje
 mkdir -p "$S_PATH/boot"
-# Uzimamo trenutne mount opcije roota za UKI kernel parametre
-R_OPTS=$(findmnt -n -o OPTIONS / | sed 's/subvol=[^,]*//g' | sed 's/,,/,/g' | sed 's/,$//')
-echo "root=UUID=$R_UUID rw rootflags=subvol=/@snapshots/$S_ID/snapshot $R_OPTS" > /tmp/rescue_cmd
-
+echo "root=UUID=$R_UUID rw rootflags=subvol=/@snapshots/$S_ID/snapshot,$R_OPTS" > /tmp/rescue_cmd
 mkinitcpio -k /boot/vmlinuz-linux -c /etc/mkinitcpio.conf --uki "$S_PATH/boot/rescue.efi" --cmdline /tmp/rescue_cmd
 chmod 644 "$S_PATH/boot/rescue.efi"
 
-# --- 5. UNIVERZALNO KRPANJE FSTAB-A (EFI/ESP Podrška) ---
-if [ -f "$S_PATH/etc/fstab" ]; then
-    # Osiguraj sve potrebne mount pointe unutar snapshota
-    mkdir -p "$S_PATH/home" "$S_PATH/var/log" "$S_PATH/var/cache/pacman/pkg" "$S_PATH/var/tmp" "$S_PATH/.snapshots" "$S_PATH/efi"
-
-    TMP_FSTAB=$(mktemp)
-    
-    while IFS= read -r line || [ -n "$line" ]; do
-        # Zadrži komentare i prazne linije
-        if [[ "$line" =~ ^# ]] || [[ -z "$line" ]]; then
-            echo "$line" >> "$TMP_FSTAB"
-            continue
-        fi
-
-        # Dohvati mount point (2. stupac)
-        MP=$(echo "$line" | awk '{print $2}')
-
-        if [ "$MP" == "/" ]; then
-            # Mijenjamo samo root subvolumen na putanju snapshota
-            echo "$line" | sed "s|\(subvol=\)[^, ]*|\1/@snapshots/$S_ID/snapshot|g" >> "$TMP_FSTAB"
-        else
-            # Sve ostale linije (/home, /efi, /mnt...) prepisujemo IDENTIČNO
-            echo "$line" >> "$TMP_FSTAB"
-        fi
-    done < "$S_PATH/etc/fstab"
-
-    mv "$TMP_FSTAB" "$S_PATH/etc/fstab"
-    chmod 644 "$S_PATH/etc/fstab"
-fi
-
-# --- 6. BACKUP I ROTACIJA ---
+# 5. Backup i rotacija
 DATE=$(date +%Y_%m_%d_%H.%M.%S)
 DEST="/.bootbackup/${DATE}_post"
 mkdir -p "$DEST"
 rsync -a --delete /boot/ "$DEST/"
 echo "$S_ID" > "$DEST/snap_id.txt"
-ls -1dt /.bootbackup/*_post/ | tail -n +6 | xargs rm -rf 2>/dev/null
 
-sync
-grub-mkconfig -o /boot/grub/grub.cfg
+# Rotacija - drži zadnjih 5
+ls -1dt /.bootbackup/*_post/ 2>/dev/null | tail -n +6 | xargs rm -rf 2>/dev/null
+
+# 6. Update GRUB unosa
+if [ -f /usr/local/bin/update-rescue-grub ]; then
+    /usr/local/bin/update-rescue-grub
+else
+    grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
 echo "--- RESCUE SPREMAN (ID: $S_ID) ---"

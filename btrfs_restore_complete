@@ -1,0 +1,416 @@
+#!/bin/bash
+
+# Btrfs restore skripta - može cijeli restore, samo @home ili samo @root
+# Automatski izbacuje rescue snapshotove iz popisa
+
+set -e
+
+BACKUP_DIR="/mnt/BACKUP"
+TEMP_MOUNT="/mnt/restore_temp"
+LOG_FILE="/var/log/btrfs_restore.log"
+TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+
+log_message() {
+    echo "[$TIMESTAMP] $1" | tee -a "$LOG_FILE"
+}
+
+# Boje za output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Funkcija za ispis s bojom
+print_status() {
+    echo -e "${GREEN}[OK]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[UPOZORENJE]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[GREŠKA]${NC} $1"
+}
+
+# ==============================================
+# FUNKCIJA ZA DOHVAĆANJE REGULARNIH ROOT SNAPSHOTOVA (BEZ RESCUE)
+# ==============================================
+get_regular_root_snapshots() {
+    local snap_list=$(ls -1 "$BACKUP_DIR/root/" 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+    local regular_snaps=""
+    
+    for snap in $snap_list; do
+        local is_rescue=0
+        
+        # Provjeri po backup_info.txt ako postoji
+        if [ -f "$BACKUP_DIR/root/$snap/backup_info.txt" ]; then
+            if grep -q "Rescue-" "$BACKUP_DIR/root/$snap/backup_info.txt"; then
+                is_rescue=1
+            fi
+        fi
+        
+        # Ako nije rescue, dodaj u listu
+        if [ "$is_rescue" -eq 0 ]; then
+            regular_snaps="$regular_snaps$snap\n"
+        fi
+    done
+    
+    echo -e "$regular_snaps" | sort -n
+}
+
+# Provjeri je li backup direktorij montiran
+if ! mountpoint -q "$BACKUP_DIR"; then
+    print_error "$BACKUP_DIR nije montiran!"
+    echo "Montiraj backup disk pa pokreni ponovo."
+    exit 1
+fi
+
+clear
+echo "=============================================="
+echo "         BTRFS RESTORE SKRIPTA"
+echo "=============================================="
+echo ""
+echo "1. CIJELI RESTORE (root, home, pkg, tmp, log)"
+echo "2. SAMO @HOME"
+echo "3. SAMO @ROOT (i EFI ako postoji)"
+echo "4. IZLAZ"
+echo ""
+read -p "Odaberi opciju [1-4]: " MODE
+
+case $MODE in
+    1) MODE="full" ;;
+    2) MODE="home_only" ;;
+    3) MODE="root_only" ;;
+    *) exit 0 ;;
+esac
+
+echo ""
+echo "=============================================="
+
+# Provjeri dostupne diskove
+echo "Dostupni diskovi:"
+lsblk -f | grep -v "loop"
+echo ""
+
+# ==============================================
+# PITANJA ZA ROOT (full i root_only mod)
+# ==============================================
+if [ "$MODE" = "full" ] || [ "$MODE" = "root_only" ]; then
+    # PITAJ TARGET DISK
+    read -p "Unesi target disk za btrfs podatke (npr. /dev/sdb1): " TARGET_DISK
+    if [ ! -b "$TARGET_DISK" ]; then
+        print_error "$TARGET_DISK nije blok uređaj!"
+        exit 1
+    fi
+
+    # PITAJ EFI PARTICIJU
+    read -p "Unesi EFI particiju (Enter ako nema, 'none' za preskakanje): " EFI_PARTITION
+    if [ -z "$EFI_PARTITION" ]; then
+        EFI_PARTITION="none"
+        print_status "EFI: preskačem"
+    elif [ "$EFI_PARTITION" != "none" ] && [ ! -b "$EFI_PARTITION" ]; then
+        print_error "$EFI_PARTITION nije blok uređaj!"
+        exit 1
+    fi
+
+    # PITAJ ROOT SNAPSHOT (samo regularni)
+    echo ""
+    echo "Dostupni root snapshotovi (regularni - bez rescue):"
+    ROOT_SNAPS=$(get_regular_root_snapshots)
+    if [ -z "$ROOT_SNAPS" ]; then
+        print_error "Nema regularnih root snapshotova!"
+        exit 1
+    fi
+    echo "$ROOT_SNAPS"
+    ROOT_LATEST=$(echo "$ROOT_SNAPS" | tail -1)
+    read -p "Odaberi root snapshot [latest=$ROOT_LATEST]: " ROOT_SNAP
+    ROOT_SNAP=${ROOT_SNAP:-$ROOT_LATEST}
+
+    if [ ! -d "$BACKUP_DIR/root/$ROOT_SNAP" ]; then
+        print_error "Root backup $ROOT_SNAP ne postoji!"
+        exit 1
+    fi
+
+    # PITAJ DATE_TAG ZA PKG/TMP/LOG (samo za full mod)
+    if [ "$MODE" = "full" ]; then
+        echo ""
+        echo "Dostupni pkg backupovi (date_tag):"
+        ls -1 "$BACKUP_DIR/pkg/" 2>/dev/null | grep -E '^[0-9]{8}_[0-9]{6}$' | sort -r
+        DATE_LATEST=$(ls -1 "$BACKUP_DIR/pkg/" 2>/dev/null | grep -E '^[0-9]{8}_[0-9]{6}$' | sort -r | head -1)
+        read -p "Odaberi date_tag [latest=$DATE_LATEST]: " DATE_TAG
+        DATE_TAG=${DATE_TAG:-$DATE_LATEST}
+    fi
+
+    # AUTOMATSKI PRONAĐI EFI DATE_TAG
+    ROOT_EFI_LINK="$BACKUP_DIR/root_to_efi.txt"
+    EFI_DATE_TAG=""
+
+    if [ -f "$ROOT_EFI_LINK" ] && [ "$EFI_PARTITION" != "none" ]; then
+        EFI_DATE_TAG=$(grep "^$ROOT_SNAP:" "$ROOT_EFI_LINK" | cut -d':' -f2 | tail -1)
+        
+        if [ -n "$EFI_DATE_TAG" ] && [ -f "$BACKUP_DIR/efi/efi_${EFI_DATE_TAG}.tar.gz" ]; then
+            print_status "Automatski pronađen EFI backup za root $ROOT_SNAP: $EFI_DATE_TAG"
+            USE_EFI="$EFI_DATE_TAG"
+        fi
+    fi
+
+    # AKO NEMA AUTOMATSKOG, PITAJ RUČNO
+    if [ -z "$USE_EFI" ] && [ "$EFI_PARTITION" != "none" ]; then
+        echo ""
+        echo "Dostupni EFI backupovi u $BACKUP_DIR/efi/:"
+        ls -1 "$BACKUP_DIR/efi/" 2>/dev/null | grep "efi_.*\.tar\.gz" | sed 's/efi_\(.*\)\.tar\.gz/\1/'
+        read -p "Odaberi date_tag za EFI (Enter za preskakanje): " EFI_DATE_TAG
+        USE_EFI="$EFI_DATE_TAG"
+    fi
+fi
+
+# ==============================================
+# PITANJA ZA HOME (full i home_only mod)
+# ==============================================
+if [ "$MODE" = "full" ] || [ "$MODE" = "home_only" ]; then
+    echo ""
+    echo "Dostupni home snapshotovi u $BACKUP_DIR/home/:"
+    if [ -d "$BACKUP_DIR/home" ]; then
+        ls -1 "$BACKUP_DIR/home/" 2>/dev/null | grep -E '^[0-9]+$' | sort -n
+        HOME_LATEST=$(ls -1 "$BACKUP_DIR/home/" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)
+        read -p "Odaberi home snapshot [latest=$HOME_LATEST, Enter za prazan]: " HOME_SNAP
+    else
+        print_warning "Nema home backupova"
+        HOME_SNAP=""
+    fi
+fi
+
+# SAŽETAK
+echo ""
+echo "=============================================="
+echo "SAŽETAK RESTORE-A:"
+echo "=============================================="
+case $MODE in
+    "full")
+        echo "Tip: CIJELI RESTORE"
+        echo "Target disk: $TARGET_DISK"
+        echo "EFI particija: ${EFI_PARTITION:-nema}"
+        echo "Root snapshot: $ROOT_SNAP"
+        echo "Date tag: $DATE_TAG"
+        echo "EFI date_tag: ${USE_EFI:-nema}"
+        echo "Home snapshot: ${HOME_SNAP:-prazan}"
+        ;;
+    "root_only")
+        echo "Tip: SAMO @ROOT"
+        echo "Target disk: $TARGET_DISK"
+        echo "EFI particija: ${EFI_PARTITION:-nema}"
+        echo "Root snapshot: $ROOT_SNAP"
+        echo "EFI date_tag: ${USE_EFI:-nema}"
+        ;;
+    "home_only")
+        echo "Tip: SAMO @HOME"
+        echo "Home snapshot: ${HOME_SNAP:-prazan}"
+        ;;
+esac
+echo "=============================================="
+
+if [ "$MODE" = "full" ] || [ "$MODE" = "root_only" ]; then
+    echo "UPOZORENJE: Ovo će FORMATIRATI:"
+    echo "  - $TARGET_DISK"
+    [ "$EFI_PARTITION" != "none" ] && echo "  - $EFI_PARTITION"
+fi
+echo ""
+
+read -p "Jeste li sigurni? (upiši YES za nastavak): " CONFIRM
+if [ "$CONFIRM" != "YES" ]; then
+    echo "Odustajem."
+    exit 1
+fi
+
+# ==============================================
+# RESTORE EFI (samo ako imamo root)
+# ==============================================
+if [ "$MODE" != "home_only" ] && [ -n "$USE_EFI" ] && [ "$EFI_PARTITION" != "none" ]; then
+    log_message "=== RESTORE EFI ==="
+    echo "Formatiram EFI particiju $EFI_PARTITION..."
+    mkfs.vfat -F32 "$EFI_PARTITION" >> "$LOG_FILE" 2>&1
+    
+    EFI_MOUNT="/mnt/efi_temp"
+    mkdir -p "$EFI_MOUNT"
+    mount "$EFI_PARTITION" "$EFI_MOUNT"
+    
+    echo "Vraćam EFI podatke..."
+    pv "$BACKUP_DIR/efi/efi_${USE_EFI}.tar.gz" | tar xzf - -C "$EFI_MOUNT" --strip-components=1
+    
+    umount "$EFI_MOUNT"
+    rmdir "$EFI_MOUNT"
+    print_status "EFI restore završen"
+fi
+
+# ==============================================
+# RESTORE BTRFS
+# ==============================================
+if [ "$MODE" = "full" ] || [ "$MODE" = "root_only" ]; then
+    # Formatiraj btrfs disk
+    log_message "=== FORMATIRAM BTRFS DISK ==="
+    echo "Formatiram $TARGET_DISK kao btrfs..."
+    mkfs.btrfs -f "$TARGET_DISK" >> "$LOG_FILE" 2>&1
+    
+    # Montiraj disk
+    log_message "=== MONTRAM DISK ==="
+    mkdir -p "$TEMP_MOUNT"
+    mount "$TARGET_DISK" "$TEMP_MOUNT"
+else
+    # SAMO HOME - montiraj postojeći disk
+    echo ""
+    echo "Dostupni diskovi za montiranje:"
+    lsblk -f | grep -v "loop"
+    echo ""
+    read -p "Unesi particiju gdje je @home (npr. /dev/nvme0n1p1): " HOME_DISK
+    if [ ! -b "$HOME_DISK" ]; then
+        print_error "$HOME_DISK nije blok uređaj!"
+        exit 1
+    fi
+    
+    mkdir -p "$TEMP_MOUNT"
+    mount "$HOME_DISK" "$TEMP_MOUNT"
+fi
+
+# ==============================================
+# RESTORE HOME (samo za full i home_only)
+# ==============================================
+if [ "$MODE" = "full" ] || [ "$MODE" = "home_only" ]; then
+    if [ -n "$HOME_SNAP" ] && [ -d "$BACKUP_DIR/home/$HOME_SNAP" ]; then
+        log_message "=== RESTORE HOME ==="
+        echo "Vraćam home snapshot $HOME_SNAP..."
+        
+        # Ako već postoji @home, obriši ga
+        if [ -d "$TEMP_MOUNT/@home" ]; then
+            echo "Brišem stari @home..."
+            btrfs subvolume delete "$TEMP_MOUNT/@home" >> "$LOG_FILE" 2>&1
+        fi
+        
+        # Pošalji backup
+        btrfs send "$BACKUP_DIR/home/$HOME_SNAP" 2>> "$LOG_FILE" | pv -trab | btrfs receive "$TEMP_MOUNT" 2>> "$LOG_FILE"
+        
+        if [ -d "$TEMP_MOUNT/$HOME_SNAP" ]; then
+            # Stvori rw snapshot iz primljenog ro snapshota
+            btrfs subvolume snapshot "$TEMP_MOUNT/$HOME_SNAP" "$TEMP_MOUNT/@home"
+            # Obriši primljeni ro snapshot
+            btrfs subvolume delete "$TEMP_MOUNT/$HOME_SNAP" >> "$LOG_FILE" 2>&1
+            print_status "Home restore završen (@home je rw)"
+        else
+            print_error "Home backup nije primljen"
+            exit 1
+        fi
+    else
+        if [ ! -d "$TEMP_MOUNT/@home" ]; then
+            echo "Stvaram prazan @home..."
+            btrfs subvolume create "$TEMP_MOUNT/@home"
+        fi
+    fi
+fi
+
+# ==============================================
+# RESTORE ROOT (samo za full i root_only)
+# ==============================================
+if [ "$MODE" = "full" ] || [ "$MODE" = "root_only" ]; then
+    # RESTORE ROOT
+    log_message "=== RESTORE ROOT ==="
+    echo "Vraćam root snapshot $ROOT_SNAP..."
+    
+    btrfs send "$BACKUP_DIR/root/$ROOT_SNAP" 2>> "$LOG_FILE" | pv -trab | btrfs receive "$TEMP_MOUNT" 2>> "$LOG_FILE"
+    
+    if [ -d "$TEMP_MOUNT/$ROOT_SNAP" ]; then
+        btrfs subvolume snapshot "$TEMP_MOUNT/$ROOT_SNAP" "$TEMP_MOUNT/@"
+        btrfs subvolume delete "$TEMP_MOUNT/$ROOT_SNAP" >> "$LOG_FILE" 2>&1
+        print_status "Root restore završen (@ je rw)"
+    else
+        print_error "Root backup nije primljen"
+        exit 1
+    fi
+
+    # RESTORE PKG, TMP, LOG (samo za full mod)
+    if [ "$MODE" = "full" ]; then
+        # RESTORE PKG
+        log_message "=== RESTORE PKG ==="
+        if [ -d "$BACKUP_DIR/pkg/$DATE_TAG" ]; then
+            echo "Vraćam pkg backup $DATE_TAG..."
+            btrfs send "$BACKUP_DIR/pkg/$DATE_TAG" 2>> "$LOG_FILE" | pv -trab | btrfs receive "$TEMP_MOUNT" 2>> "$LOG_FILE"
+            
+            if [ -d "$TEMP_MOUNT/$DATE_TAG" ]; then
+                btrfs subvolume snapshot "$TEMP_MOUNT/$DATE_TAG" "$TEMP_MOUNT/@pkg"
+                btrfs subvolume delete "$TEMP_MOUNT/$DATE_TAG" >> "$LOG_FILE" 2>&1
+                print_status "Pkg restore završen"
+            fi
+        else
+            [ ! -d "$TEMP_MOUNT/@pkg" ] && btrfs subvolume create "$TEMP_MOUNT/@pkg"
+        fi
+
+        # RESTORE TMP
+        log_message "=== RESTORE TMP ==="
+        if [ -d "$BACKUP_DIR/tmp/$DATE_TAG" ]; then
+            echo "Vraćam tmp backup $DATE_TAG..."
+            btrfs send "$BACKUP_DIR/tmp/$DATE_TAG" 2>> "$LOG_FILE" | pv -trab | btrfs receive "$TEMP_MOUNT" 2>> "$LOG_FILE"
+            
+            if [ -d "$TEMP_MOUNT/$DATE_TAG" ]; then
+                btrfs subvolume snapshot "$TEMP_MOUNT/$DATE_TAG" "$TEMP_MOUNT/@tmp"
+                btrfs subvolume delete "$TEMP_MOUNT/$DATE_TAG" >> "$LOG_FILE" 2>&1
+                print_status "Tmp restore završen"
+            fi
+        else
+            [ ! -d "$TEMP_MOUNT/@tmp" ] && btrfs subvolume create "$TEMP_MOUNT/@tmp"
+        fi
+
+        # RESTORE LOG
+        log_message "=== RESTORE LOG ==="
+        if [ -d "$BACKUP_DIR/log/$DATE_TAG" ]; then
+            echo "Vraćam log backup $DATE_TAG..."
+            btrfs send "$BACKUP_DIR/log/$DATE_TAG" 2>> "$LOG_FILE" | pv -trab | btrfs receive "$TEMP_MOUNT" 2>> "$LOG_FILE"
+            
+            if [ -d "$TEMP_MOUNT/$DATE_TAG" ]; then
+                btrfs subvolume snapshot "$TEMP_MOUNT/$DATE_TAG" "$TEMP_MOUNT/@log"
+                btrfs subvolume delete "$TEMP_MOUNT/$DATE_TAG" >> "$LOG_FILE" 2>&1
+                print_status "Log restore završen"
+            fi
+        else
+            [ ! -d "$TEMP_MOUNT/@log" ] && btrfs subvolume create "$TEMP_MOUNT/@log"
+        fi
+    fi
+
+    # KREIRAJ DIREKTORIJE
+    log_message "=== KREIRAM DIREKTORIJE ==="
+    mkdir -p "$TEMP_MOUNT/.snapshots"
+    mkdir -p "$TEMP_MOUNT/home/.snapshots"
+    mkdir -p "$TEMP_MOUNT/efi"
+    mkdir -p "$TEMP_MOUNT/boot" "$TEMP_MOUNT/dev" "$TEMP_MOUNT/proc" "$TEMP_MOUNT/sys" "$TEMP_MOUNT/run"
+fi
+
+# ==============================================
+# UNMOUNT
+# ==============================================
+log_message "=== UNMOUNT ==="
+umount "$TEMP_MOUNT"
+rmdir "$TEMP_MOUNT" 2>/dev/null || true
+
+echo ""
+echo "=============================================="
+echo "RESTORE ZAVRŠEN!"
+echo "=============================================="
+case $MODE in
+    "full")
+        echo "Cijeli sustav vraćen na $TARGET_DISK"
+        [ -n "$HOME_SNAP" ] && echo "Home snapshot $HOME_SNAP vraćen"
+        [ -n "$USE_EFI" ] && echo "EFI backup $USE_EFI vraćen na $EFI_PARTITION"
+        echo ""
+        echo "SVI PODVOLUMENI SU READ-WRITE (spremni za boot)"
+        ;;
+    "root_only")
+        echo "Root snapshot $ROOT_SNAP vraćen na $TARGET_DISK"
+        [ -n "$USE_EFI" ] && echo "EFI backup $USE_EFI vraćen na $EFI_PARTITION"
+        echo ""
+        echo "@ JE READ-WRITE (spremno za boot)"
+        ;;
+    "home_only")
+        echo "Home snapshot ${HOME_SNAP:-prazan} vraćen na $HOME_DISK"
+        echo ""
+        echo "@home JE READ-WRITE"
+        ;;
+esac
+echo "=============================================="

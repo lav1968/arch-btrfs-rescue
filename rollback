@@ -1,0 +1,103 @@
+#!/bin/bash
+# --- ROLLBACK SUSTAVA IZ SNAPSHOTA (ZADNJA VERZIJA) ---
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "GRESKA: Pokrenite kao root."
+    exit 1
+fi
+
+# Force opcija
+FORCE=0
+[[ "$1" == "--force" ]] && FORCE=1
+
+# PROVJERA: Jel bootan snapshot?
+CURRENT_PATH=$(findmnt -n -o SOURCE /)
+echo "Trenutni source: $CURRENT_PATH"
+
+if [[ "$CURRENT_PATH" != *"snapshots"* ]] && [[ "$CURRENT_PATH" != *"@snapshots"* ]]; then
+    if [ $FORCE -eq 1 ]; then
+        echo "UPOZORENJE: Forsiranje rollback-a iako niste bootani iz snapshot-a!"
+        sleep 3
+    else
+        echo "GRESKA: Niste bootani iz snapshot-a!"
+        echo "Rollback se smije raditi SAMO kada je sustav bootan iz snapshot-a."
+        exit 1
+    fi
+fi
+
+# Detekcija SNAP_ID
+if [[ "$CURRENT_PATH" =~ snapshots/([0-9]+)/snapshot ]]; then
+    SNAP_ID="${BASH_REMATCH[1]}"
+elif [[ "$CURRENT_PATH" =~ \[.*@snapshots/([0-9]+)/snapshot\] ]]; then
+    SNAP_ID="${BASH_REMATCH[1]}"
+else
+    SNAP_ID=$(echo "$CURRENT_PATH" | grep -oP '(?<=snapshots/)\d+' 2>/dev/null)
+fi
+
+[ -z "$SNAP_ID" ] && { echo "GRESKA: Ne mogu detektirati SNAP_ID"; exit 1; }
+
+echo "Detektiran SNAP_ID: $SNAP_ID"
+echo "--- START: ROLLBACK IZ SNAPSHOTA $SNAP_ID ---"
+
+# DETEKCIJA UREĐAJA
+ROOT_UUID=$(findmnt -n -o UUID /)
+[ -n "$ROOT_UUID" ] && DEVICE="UUID=$ROOT_UUID" || DEVICE=$(findmnt -n -o SOURCE / | cut -d'[' -f1 | cut -d' ' -f1)
+
+MOUNT_ROOT="/mnt/btrfs_base"
+mkdir -p "$MOUNT_ROOT"
+
+# Montiraj top-level
+if [[ "$DEVICE" == UUID=* ]]; then
+    mount -t btrfs -o subvolid=5 "$DEVICE" "$MOUNT_ROOT" || exit 1
+else
+    mount -t btrfs -o subvolid=5 "$DEVICE" "$MOUNT_ROOT" || exit 1
+fi
+
+# Provjera snapshot-a
+SRC="$MOUNT_ROOT/@snapshots/$SNAP_ID/snapshot"
+if [ ! -d "$SRC" ]; then
+    echo "GRESKA: Snapshot $SNAP_ID ne postoji!"
+    ls -la "$MOUNT_ROOT/@snapshots/" 2>/dev/null
+    umount "$MOUNT_ROOT"
+    exit 1
+fi
+
+# Backup trenutnog @
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+if [ -d "$MOUNT_ROOT/@" ]; then
+    echo "Spremam trenutni @ u @_broken_$TIMESTAMP"
+    mv "$MOUNT_ROOT/@" "$MOUNT_ROOT/@_broken_$TIMESTAMP" || {
+        echo "GRESKA: Ne mogu premjestiti @ subvolum"
+        umount "$MOUNT_ROOT"
+        exit 1
+    }
+else
+    echo "UPOZORENJE: @ subvolum ne postoji, stvaram ga iz snapshot-a"
+fi
+
+# Kreiraj novi @ iz snapshot-a
+echo "Vraćam sustav na Snapshot ID: $SNAP_ID"
+btrfs subvolume snapshot "$SRC" "$MOUNT_ROOT/@" || {
+    echo "GRESKA: Ne mogu kreirati snapshot"
+    umount "$MOUNT_ROOT"
+    exit 1
+}
+
+# POPRAVAK FSTAB-a - uklanja subvolid
+TARGET_FSTAB="$MOUNT_ROOT/@/etc/fstab"
+if [ -f "$TARGET_FSTAB" ]; then
+    echo "Popravljam fstab (uklanjam subvolid)..."
+    cp "$TARGET_FSTAB" "$TARGET_FSTAB.bak"
+    
+    # Ukloni sve subvolid= iz root linije
+    sed -i "/[[:space:]]\/[[:space:]]/ s|subvolid=[0-9]*||g" "$TARGET_FSTAB"
+    # Očisti zareze ako je ostalo
+    sed -i "/[[:space:]]\/[[:space:]]/ s|,,*|,|g; s|,[[:space:]]|[[:space:]]|g" "$TARGET_FSTAB"
+    
+    echo "Fstab popravljen. Original sačuvan kao fstab.bak"
+else
+    echo "UPOZORENJE: /etc/fstab nije pronađen"
+fi
+
+umount "$MOUNT_ROOT"
+echo "--- ROLLBACK GOTOV. Možete rebootati. ---"

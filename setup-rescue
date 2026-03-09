@@ -1,0 +1,162 @@
+#!/bin/bash
+# --- SETUP RESCUE SYSTEM (ZADNJA VERZIJA) ---
+if [ "$EUID" -ne 0 ]; then
+  echo "GRESKA: Pokrenite kao root (sudo ./setup-rescue.sh)."
+  exit 1
+fi
+
+# Provjera Btrfs alata
+if ! command -v btrfs &> /dev/null; then
+    echo "Instaliram btrfs-progs..."
+    pacman -S --noconfirm btrfs-progs
+fi
+
+echo "--- FAZA 1: Instalacija i detekcija ---"
+pacman -Sy --needed --noconfirm snapper rsync mkinitcpio
+
+ROOT_UUID=$(findmnt -n -o UUID /)
+BOOT_UUID=$(findmnt -n -o UUID /boot)
+
+if [ -z "$ROOT_UUID" ]; then
+    echo "GRESKA: Ne mogu detektirati ROOT UUID!"
+    exit 1
+fi
+
+# Dohvati trenutne mount opcije za root (bez subvolid)
+ROOT_OPTS=$(findmnt -n -o OPTIONS / | sed 's/subvol=[^,]*//g; s/subvolid=[^,]*//g; s/,,*/,/g; s/^,//; s/,$//')
+
+# Snapper Initial Setup
+if [ ! -f "/etc/snapper/configs/root" ]; then
+    umount /.snapshots 2>/dev/null
+    rm -rf /.snapshots
+    snapper -c root create-config /
+    chmod 750 /.snapshots
+fi
+
+echo "--- FAZA 2: Instalacija glavne rescue skripte ---"
+cat << EOF > /usr/local/bin/create-rescue-snapshot
+#!/bin/bash
+# 1. Zastita
+CURRENT_OPTS=\$(findmnt -n -o SOURCE /)
+if [[ "\$CURRENT_OPTS" == *"@snapshots"* ]]; then
+    echo "Sustav je bootan iz snapshota. Preskacem."
+    exit 0
+fi
+
+# 2. Parametri (dohvaćeni prilikom setup-a)
+R_UUID="$ROOT_UUID"
+B_UUID="$BOOT_UUID"
+R_OPTS="$ROOT_OPTS"
+
+sync
+
+# 3. Snapshot
+S_ID=\$(snapper -c root create -d "Rescue-\$(date +%Y%m%d)" --print-number)
+[ -z "\$S_ID" ] && exit 1
+S_PATH="/.snapshots/\$S_ID/snapshot"
+btrfs property set -ts "\$S_PATH" ro false
+
+# 4. UKI Generiranje
+mkdir -p "\$S_PATH/boot"
+echo "root=UUID=\$R_UUID rw rootflags=subvol=/@snapshots/\$S_ID/snapshot,\$R_OPTS" > /tmp/rescue_cmd
+mkinitcpio -k /boot/vmlinuz-linux -c /etc/mkinitcpio.conf --uki "\$S_PATH/boot/rescue.efi" --cmdline /tmp/rescue_cmd
+chmod 644 "\$S_PATH/boot/rescue.efi"
+
+# 5. Backup i rotacija
+DATE=\$(date +%Y_%m_%d_%H.%M.%S)
+DEST="/.bootbackup/\${DATE}_post"
+mkdir -p "\$DEST"
+rsync -a --delete /boot/ "\$DEST/"
+echo "\$S_ID" > "\$DEST/snap_id.txt"
+
+# Rotacija - drži zadnjih 5
+ls -1dt /.bootbackup/*_post/ 2>/dev/null | tail -n +6 | xargs rm -rf 2>/dev/null
+
+# 6. Update GRUB unosa
+if [ -f /usr/local/bin/update-rescue-grub ]; then
+    /usr/local/bin/update-rescue-grub
+else
+    grub-mkconfig -o /boot/grub/grub.cfg
+fi
+
+echo "--- RESCUE SPREMAN (ID: \$S_ID) ---"
+EOF
+
+chmod +x /usr/local/bin/create-rescue-snapshot
+
+echo "--- FAZA 3: Postavljanje GRUB update skripte ---"
+cat << 'EOF' > /usr/local/bin/update-rescue-grub
+#!/bin/bash
+# Update GRUB sa rescue snapshotovima
+
+GRUB_FILE="/etc/grub.d/40_custom"
+UUID=$(findmnt -n -o UUID /)
+
+# Obriši stare backupove
+rm -f /etc/grub.d/40_custom.backup.*
+
+# Kreiraj novi 40_custom
+cat > "$GRUB_FILE" << 'GRUBHEADER'
+#!/bin/sh
+exec tail -n +3 $0
+# Rescue snapshot entries - automatski generirano
+GRUBHEADER
+
+count=0
+for d in /.bootbackup/*_post/; do
+    [ -d "$d" ] || continue
+    sid_file="$d/snap_id.txt"
+    [ -f "$sid_file" ] || continue
+    
+    sid=$(cat "$sid_file" 2>/dev/null)
+    [ -z "$sid" ] && continue
+    
+    cat >> "$GRUB_FILE" << GRUBENTRY
+menuentry "RESCUE Snapshot #$sid (UKI)" --class recovery {
+    insmod btrfs
+    search --no-floppy --set=root --fs-uuid $UUID
+    chainloader /@snapshots/$sid/snapshot/boot/rescue.efi
+}
+GRUBENTRY
+    
+    count=$((count + 1))
+    [ "$count" -ge 5 ] && break
+done
+
+chmod +x "$GRUB_FILE"
+grub-mkconfig -o /boot/grub/grub.cfg
+echo "GRUB update gotov za $count rescue unosa."
+EOF
+
+chmod +x /usr/local/bin/update-rescue-grub
+
+echo "--- FAZA 4: Postavljanje Hook-a ---"
+mkdir -p /etc/pacman.d/hooks
+
+cat << EOF > /etc/pacman.d/hooks/99-bootbackup.hook
+[Trigger]
+Operation = Upgrade
+Operation = Install
+Type = Package
+Target = linux
+Target = mkinitcpio
+Target = systemd
+[Action]
+Description = Generiranje Rescue Snapshota i GRUB unosa
+When = PostTransaction
+Exec = /usr/local/bin/create-rescue-snapshot
+EOF
+
+# Enable timere
+for timer in snapper-timeline.timer snapper-cleanup.timer; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "$timer"; then
+        systemctl enable --now "$timer" 2>/dev/null || echo "Upozorenje: Ne mogu enable-ati $timer"
+    fi
+done
+
+# Prvo pokretanje
+echo "--- FAZA 5: Prvo pokretanje ---"
+/usr/local/bin/update-rescue-grub
+
+echo "--- SETUP ZAVRSEN ---"
+echo "Rescue snapshotovi će se automatski stvarati pri svakoj nadogradnji."

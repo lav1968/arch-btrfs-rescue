@@ -1,0 +1,396 @@
+#!/bin/bash
+
+# Btrfs backup skripta - možeš birati što backupiraš
+# Opcije: root, home, pkg/tmp/log (bilo koja kombinacija)
+# Čuva samo zadnjih 10 backupova za svaku kategoriju
+
+set -e
+
+# Konfiguracija
+BACKUP_DIR="/mnt/BACKUP"
+EFI_SOURCE="/efi"
+TEMP_SNAP_DIR="/home/tmp_snapshots"  # Direktorij za privremene snapshotove
+KEEP_BACKUPS=10  # Koliko zadnjih backupova želimo zadržati
+
+# Provjeri je li backup direktorij montiran
+if ! mountpoint -q "$BACKUP_DIR"; then
+    echo "ERROR: $BACKUP_DIR nije montiran!"
+    exit 1
+fi
+
+# Provjeri postoji li temp direktorij
+if [ ! -d "$TEMP_SNAP_DIR" ]; then
+    mkdir -p "$TEMP_SNAP_DIR"
+    echo "Kreiran $TEMP_SNAP_DIR"
+fi
+
+DATE_TAG=$(date +%Y%m%d_%H%M%S)
+
+echo "=========================================="
+echo "         BTRFS BACKUP SKRIPTA"
+echo "=========================================="
+echo "Datum: $(date)"
+echo "Backup dir: $BACKUP_DIR"
+echo "Čuvam zadnjih $KEEP_BACKUPS backupova"
+echo "=========================================="
+echo ""
+
+# ==============================================
+# IZBOR ŠTO BACKUPIRATI
+# ==============================================
+echo "Odaberi što želiš backupirati:"
+echo "1. SAMO ROOT"
+echo "2. SAMO HOME"
+echo "3. ROOT + HOME"
+echo "4. ROOT + HOME + PKG/TMP/LOG (puno)"
+echo "5. SAMO PKG/TMP/LOG"
+echo "6. IZLAZ"
+echo ""
+read -p "Odaberi opciju [1-6]: " CHOICE
+
+case $CHOICE in
+    1) DO_ROOT=1; DO_HOME=0; DO_OTHER=0 ;;
+    2) DO_ROOT=0; DO_HOME=1; DO_OTHER=0 ;;
+    3) DO_ROOT=1; DO_HOME=1; DO_OTHER=0 ;;
+    4) DO_ROOT=1; DO_HOME=1; DO_OTHER=1 ;;
+    5) DO_ROOT=0; DO_HOME=0; DO_OTHER=1 ;;
+    *) exit 0 ;;
+esac
+
+# ==============================================
+# FUNKCIJA ZA ROTACIJU BACKUPOVA (briše najstarije)
+# ==============================================
+rotate_backups() {
+    local dir=$1          # Npr. /mnt/BACKUP/root
+    local keep=$2         # Koliko zadnjih želimo zadržati
+    local pattern=$3      # Za root/home: '^[0-9]+$', za pkg/tmp/log/efi: '^[0-9]{8}_[0-9]{6}(\.tar\.gz)?$'
+    
+    if [ ! -d "$dir" ]; then
+        return 0
+    fi
+    
+    # Pronađi sve backupove sortirane (stariji prvi)
+    local backups=$(ls -1 "$dir" 2>/dev/null | grep -E "$pattern" | sort)
+    local count=$(echo "$backups" | wc -l)
+    
+    if [ "$count" -gt "$keep" ]; then
+        local to_delete=$((count - keep))
+        echo "  Rotacija za $dir: ima $count, želimo $keep, brišem $to_delete najstarijih"
+        
+        echo "$backups" | head -n "$to_delete" | while read old; do
+            if [ -d "$dir/$old" ]; then
+                echo "    Brišem $old"
+                # Ako je btrfs podvolumen, treba ga obrisati s -r
+                if btrfs subvolume show "$dir/$old" &>/dev/null; then
+                    btrfs subvolume delete "$dir/$old" > /dev/null 2>&1
+                else
+                    rm -rf "$dir/$old"
+                fi
+            elif [ -f "$dir/$old" ]; then
+                echo "    Brišem $old"
+                rm -f "$dir/$old"
+            fi
+        done
+    fi
+}
+
+# ==============================================
+# BACKUP EFI (samo ako radimo root)
+# ==============================================
+if [ "$DO_ROOT" = 1 ] && mountpoint -q "$EFI_SOURCE"; then
+    echo ""
+    echo "=== 0. EFI PARTICIJA ==="
+    echo "EFI particija montirana na $EFI_SOURCE"
+    
+    mkdir -p "$BACKUP_DIR/efi"
+    EFI_BACKUP_FILE="$BACKUP_DIR/efi/efi_${DATE_TAG}.tar.gz"
+    EFI_SIZE=$(du -sb "$EFI_SOURCE" | awk '{print $1}')
+    
+    tar czf "$EFI_BACKUP_FILE" -C "$(dirname "$EFI_SOURCE")" "$(basename "$EFI_SOURCE")" | pv -s "$EFI_SIZE" > /dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✓ EFI backup uspješan"
+    else
+        echo "  ✗ ERROR: EFI backup nije uspio"
+        exit 1
+    fi
+elif [ "$DO_ROOT" = 1 ] && ! mountpoint -q "$EFI_SOURCE"; then
+    echo ""
+    echo "=== 0. EFI PARTICIJA ==="
+    echo "WARNING: $EFI_SOURCE nije montiran, preskačem EFI backup"
+fi
+
+# ==============================================
+# FUNKCIJA ZA BACKUP PODVOLUMENA (root ili home)
+# ==============================================
+backup_snapshot_series() {
+    local name=$1          # "root" ili "home"
+    local source_dir=$2    # "/.snapshots" ili "/home/.snapshots"
+    local backup_base="$BACKUP_DIR/$name"
+    
+    echo ""
+    echo "=== Backup za $name ==="
+    
+    echo "Dostupni ${name} snapshotovi u $source_dir:"
+    local snap_list=$(ls -1 "$source_dir/" 2>/dev/null | grep -E '^[0-9]+$' | sort -n)
+    echo "$snap_list"
+    
+    local latest=$(echo "$snap_list" | tail -1)
+    read -p "Odaberi ${name} snapshot [latest=$latest, Enter za preskakanje]: " snap
+    
+    if [ -z "$snap" ]; then
+        echo "  Preskačem $name"
+        return 0
+    fi
+    
+    local target_snap=$snap
+    
+    # Provjeri postoji li snapshot na izvoru
+    if [ ! -d "$source_dir/$target_snap/snapshot" ]; then
+        echo "  ERROR: Snapshot $target_snap ne postoji!"
+        return 1
+    fi
+    
+    mkdir -p "$backup_base"
+    
+    # Pronađi zadnji backup na odredištu
+    local last_backup=$(ls -1 "$backup_base/" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)
+    
+    if [ -z "$last_backup" ]; then
+        # Nema niti jednog backupa - radi full
+        echo "  Nema prethodnih backupova, radim full backup za $target_snap"
+        btrfs send "$source_dir/$target_snap/snapshot" | pv -trab | btrfs receive "$backup_base"
+        
+        if [ -d "$backup_base/snapshot" ]; then
+            mv "$backup_base/snapshot" "$backup_base/$target_snap"
+        fi
+        echo "  ✓ Full backup za $target_snap"
+        
+    elif [ "$target_snap" -gt "$last_backup" ]; then
+        # Trebamo napraviti sve od last_backup+1 do target_snap
+        echo "  Zadnji backup: $last_backup"
+        echo "  Ciljani snapshot: $target_snap"
+        
+        local current=$((last_backup + 1))
+        
+        while [ "$current" -le "$target_snap" ]; do
+            echo "  Radim backup za $current"
+            
+            # Provjeri postoji li snapshot na izvoru
+            if [ ! -d "$source_dir/$current/snapshot" ]; then
+                echo "  ERROR: Snapshot $current ne postoji na izvoru! Prekidam lanac."
+                return 1
+            fi
+            
+            if [ -d "$backup_base/$((current - 1))" ]; then
+                echo "    Incremental od $((current - 1)) do $current"
+                btrfs send -p "$source_dir/$((current - 1))/snapshot" "$source_dir/$current/snapshot" | pv -trab | btrfs receive "$backup_base"
+            else
+                echo "    Full backup za $current (nema prethodnog backupa)"
+                btrfs send "$source_dir/$current/snapshot" | pv -trab | btrfs receive "$backup_base"
+            fi
+            
+            # Preimenuj snapshot
+            if [ -d "$backup_base/snapshot" ]; then
+                mv "$backup_base/snapshot" "$backup_base/$current"
+            fi
+            
+            echo "    ✓ Backup za $current gotov"
+            current=$((current + 1))
+        done
+        
+        echo "  ✓ Svi backupovi do $target_snap su napravljeni"
+        
+    elif [ "$target_snap" -eq "$last_backup" ]; then
+        echo "  Backup za $target_snap već postoji, preskačem"
+    else
+        echo "  Backup za $target_snap već postoji (imaš i novije), preskačem"
+    fi
+    
+    # Poveži root s EFI date_tag (samo za root)
+    if [ "$name" = "root" ] && [ -f "$BACKUP_DIR/efi/efi_${DATE_TAG}.tar.gz" ]; then
+        ROOT_EFI_LINK="$BACKUP_DIR/root_to_efi.txt"
+        echo "$target_snap:$DATE_TAG" >> "$ROOT_EFI_LINK"
+        sort -u -o "$ROOT_EFI_LINK" "$ROOT_EFI_LINK"
+        echo "  Poveznica root $target_snap -> efi $DATE_TAG spremljena"
+    fi
+    
+    # Spremi odabrani snapshot za manifest
+    if [ "$name" = "root" ]; then
+        ROOT_SNAP="$target_snap"
+    elif [ "$name" = "home" ]; then
+        HOME_SNAP="$target_snap"
+    fi
+    
+    return 0
+}
+
+# ==============================================
+# BACKUP ZA ROOT
+# ==============================================
+if [ "$DO_ROOT" = 1 ]; then
+    backup_snapshot_series "root" "/.snapshots"
+    ROOT_DONE=1
+else
+    ROOT_SNAP="nije rađen"
+    ROOT_DONE=0
+fi
+
+# ==============================================
+# BACKUP ZA HOME
+# ==============================================
+if [ "$DO_HOME" = 1 ]; then
+    backup_snapshot_series "home" "/home/.snapshots"
+    HOME_DONE=1
+else
+    HOME_SNAP="nije rađen"
+    HOME_DONE=0
+fi
+
+# ==============================================
+# BACKUP ZA PKG, TMP, LOG
+# ==============================================
+if [ "$DO_OTHER" = 1 ]; then
+    echo ""
+    echo "=== 3. PKG, TMP, LOG (full backup) ==="
+
+    for SUBVOL_NAME in pkg tmp log; do
+        case $SUBVOL_NAME in
+            pkg) SOURCE="/var/cache/pacman/pkg" ;;
+            tmp) SOURCE="/var/tmp" ;;
+            log) SOURCE="/var/log" ;;
+        esac
+        
+        echo "Backup za $SUBVOL_NAME ($SOURCE)"
+        
+        # Napravi read-only snapshot u /home/tmp_snapshots
+        TEMP_SNAPSHOT="$TEMP_SNAP_DIR/${SUBVOL_NAME}_snapshot_$$"
+        echo "  Stvaram read-only snapshot u $TEMP_SNAPSHOT"
+        btrfs subvolume snapshot -r "$SOURCE" "$TEMP_SNAPSHOT"
+        
+        # Pošalji backup
+        mkdir -p "$BACKUP_DIR/$SUBVOL_NAME"
+        echo "  Šaljem backup"
+        btrfs send "$TEMP_SNAPSHOT" | pv -trab | btrfs receive "$BACKUP_DIR/$SUBVOL_NAME"
+        
+        if [ $? -eq 0 ]; then
+            echo "  ✓ Backup uspješan"
+            
+            # Preimenuj primljeni snapshot u datumski tag
+            if [ -d "$BACKUP_DIR/$SUBVOL_NAME/$(basename "$TEMP_SNAPSHOT")" ]; then
+                mv "$BACKUP_DIR/$SUBVOL_NAME/$(basename "$TEMP_SNAPSHOT")" "$BACKUP_DIR/$SUBVOL_NAME/$DATE_TAG"
+            fi
+        else
+            echo "  ✗ ERROR: Backup nije uspio"
+            # Obriši privremeni snapshot prije izlaska
+            btrfs subvolume delete "$TEMP_SNAPSHOT"
+            exit 1
+        fi
+        
+        # Obriši privremeni snapshot
+        echo "  Brišem privremeni snapshot"
+        btrfs subvolume delete "$TEMP_SNAPSHOT"
+    done
+    OTHER_DONE=1
+else
+    OTHER_DONE=0
+fi
+
+# ==============================================
+# KREIRAJ MANIFEST
+# ==============================================
+echo ""
+echo "=== 4. KREIRAM MANIFEST ==="
+
+MANIFEST_FILE="$BACKUP_DIR/backup_manifest_${DATE_TAG}.txt"
+{
+    echo "BACKUP MANIFEST - $(date)"
+    echo "=================================="
+    echo "Root snapshot: $ROOT_SNAP"
+    echo "Home snapshot: $HOME_SNAP"
+    echo "EFI date_tag: $([ "$DO_ROOT" = 1 ] && echo "$DATE_TAG" || echo "nije rađen")"
+    echo "=================================="
+    echo ""
+    
+    if [ "$DO_ROOT" = 1 ] && [ -f "$BACKUP_DIR/efi/efi_${DATE_TAG}.tar.gz" ]; then
+        echo "EFI:"
+        EFI_SIZE=$(du -sh "$BACKUP_DIR/efi/efi_${DATE_TAG}.tar.gz" | cut -f1)
+        echo "  EFI: $EFI_SIZE"
+        echo ""
+    fi
+    
+    if [ "$DO_ROOT" = 1 ] && [ -d "$BACKUP_DIR/root/$ROOT_SNAP" ]; then
+        echo "ROOT:"
+        ROOT_SIZE=$(du -sh "$BACKUP_DIR/root/$ROOT_SNAP" 2>/dev/null | cut -f1)
+        echo "  root: $ROOT_SIZE (snapshot $ROOT_SNAP)"
+        echo ""
+    fi
+    
+    if [ "$DO_HOME" = 1 ] && [ -n "$HOME_SNAP" ] && [ -d "$BACKUP_DIR/home/$HOME_SNAP" ]; then
+        echo "HOME:"
+        HOME_SIZE=$(du -sh "$BACKUP_DIR/home/$HOME_SNAP" 2>/dev/null | cut -f1)
+        echo "  home: $HOME_SIZE (snapshot $HOME_SNAP)"
+        echo ""
+    fi
+    
+    if [ "$DO_OTHER" = 1 ]; then
+        echo "PKG, TMP, LOG:"
+        for SUBVOL_NAME in pkg tmp log; do
+            if [ -d "$BACKUP_DIR/$SUBVOL_NAME/$DATE_TAG" ]; then
+                SIZE=$(du -sh "$BACKUP_DIR/$SUBVOL_NAME/$DATE_TAG" 2>/dev/null | cut -f1)
+                echo "  $SUBVOL_NAME: $SIZE"
+            fi
+        done
+    fi
+} > "$MANIFEST_FILE"
+
+echo "Manifest spremljen u $MANIFEST_FILE"
+
+# ==============================================
+# ROTACIJA BACKUPOVA (na kraju, nakon manifesta)
+# ==============================================
+echo ""
+echo "=== 5. ROTACIJA BACKUPOVA ==="
+
+# Root (brojevi)
+if [ -d "$BACKUP_DIR/root" ]; then
+    rotate_backups "$BACKUP_DIR/root" "$KEEP_BACKUPS" '^[0-9]+$'
+fi
+
+# Home (brojevi)
+if [ -d "$BACKUP_DIR/home" ]; then
+    rotate_backups "$BACKUP_DIR/home" "$KEEP_BACKUPS" '^[0-9]+$'
+fi
+
+# Pkg (date_tag)
+if [ -d "$BACKUP_DIR/pkg" ]; then
+    rotate_backups "$BACKUP_DIR/pkg" "$KEEP_BACKUPS" '^[0-9]{8}_[0-9]{6}$'
+fi
+
+# Tmp (date_tag)
+if [ -d "$BACKUP_DIR/tmp" ]; then
+    rotate_backups "$BACKUP_DIR/tmp" "$KEEP_BACKUPS" '^[0-9]{8}_[0-9]{6}$'
+fi
+
+# Log (date_tag)
+if [ -d "$BACKUP_DIR/log" ]; then
+    rotate_backups "$BACKUP_DIR/log" "$KEEP_BACKUPS" '^[0-9]{8}_[0-9]{6}$'
+fi
+
+# Efi (date_tag .tar.gz)
+if [ -d "$BACKUP_DIR/efi" ]; then
+    rotate_backups "$BACKUP_DIR/efi" "$KEEP_BACKUPS" '^efi_[0-9]{8}_[0-9]{6}\.tar\.gz$'
+fi
+
+# root_to_efi.txt (posebno - spremi samo zadnjih KEEP_BACKUPS linija)
+if [ -f "$BACKUP_DIR/root_to_efi.txt" ]; then
+    echo "  Rotacija za root_to_efi.txt"
+    tail -n "$KEEP_BACKUPS" "$BACKUP_DIR/root_to_efi.txt" > "$BACKUP_DIR/root_to_efi.txt.tmp"
+    mv "$BACKUP_DIR/root_to_efi.txt.tmp" "$BACKUP_DIR/root_to_efi.txt"
+fi
+
+echo ""
+echo "=== BACKUP ZAVRŠEN ==="
+echo "Datum: $(date)"
+echo "Zadržano zadnjih $KEEP_BACKUPS backupova"
+cat "$MANIFEST_FILE"
